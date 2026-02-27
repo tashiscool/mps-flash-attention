@@ -8,6 +8,7 @@
 import Foundation
 import Metal
 import FlashAttention
+import MetalASM
 import CryptoKit
 
 /// Manages pre-compiled metallib files and pipeline binaries for instant kernel loading
@@ -104,79 +105,24 @@ public class MetallibCache {
         return library
     }
 
-    /// Compile shader and save metallib to disk
+    /// Compile LLVM IR source to metallib and save to disk cache
     private func compileAndCache(source: String, key: String, device: MTLDevice) throws -> MTLLibrary {
-        let fileManager = FileManager.default
-        let tempDir = fileManager.temporaryDirectory
-        let uuid = UUID().uuidString
+        // Source is now LLVM IR — assemble via MetalASM
+        let metallibData: Data
+        #if os(macOS)
+        metallibData = try MetalASM.assemble(ir: source, platform: .macOS(version: 26))
+        #elseif os(iOS)
+        metallibData = try MetalASM.assemble(ir: source, platform: .iOS(version: 26))
+        #endif
 
-        let sourceFile = tempDir.appendingPathComponent("mfa_\(uuid).metal")
-        let airFile = tempDir.appendingPathComponent("mfa_\(uuid).air")
-        let tempMetallib = tempDir.appendingPathComponent("mfa_\(uuid).metallib")
+        // Cache to disk
         let finalMetallib = metallibPath(for: key)
-
-        defer {
-            try? fileManager.removeItem(at: sourceFile)
-            try? fileManager.removeItem(at: airFile)
-            try? fileManager.removeItem(at: tempMetallib)
-        }
-
-        // Metal 2.4 is required on macOS 15+ (Sequoia) and 26 (Tahoe) for __asm compatibility.
-        // But Metal 2.4 doesn't have bfloat type (added in Metal 3.0).
-        // Solution: When using Metal 2.4, inject bfloat typedef as alias to half.
-        let usesMetal24 = source.contains("__asm")
-        var finalSource = source
-        if usesMetal24 && source.contains("bfloat") {
-            // Inject bfloat typedef at the beginning (after any includes)
-            // bfloat is semantically similar to half for our purposes
-            let bfloatTypedef = """
-            // Metal 2.4 compatibility: bfloat type alias (bfloat added in Metal 3.0)
-            #ifndef __HAVE_BFLOAT__
-            typedef half bfloat;
-            typedef half2 bfloat2;
-            typedef half4 bfloat4;
-            typedef packed_half2 packed_bfloat2;
-            typedef packed_half4 packed_bfloat4;
-            #endif
-
-            """
-            // Insert after the first #include or at the beginning
-            if let includeRange = source.range(of: "#include", options: .literal) {
-                // Find end of line after first include
-                if let newlineRange = source.range(of: "\n", range: includeRange.upperBound..<source.endIndex) {
-                    let insertIndex = newlineRange.upperBound
-                    finalSource = String(source[..<insertIndex]) + bfloatTypedef + String(source[insertIndex...])
-                } else {
-                    finalSource = bfloatTypedef + source
-                }
-            } else {
-                finalSource = bfloatTypedef + source
-            }
-        }
-
-        // Write source
-        try finalSource.write(to: sourceFile, atomically: true, encoding: .utf8)
-
-        let stdFlag = usesMetal24 ? "-std=macos-metal2.4 " : ""
-        let compileResult = shell("xcrun -sdk macosx metal \(stdFlag)-c '\(sourceFile.path)' -o '\(airFile.path)' 2>&1")
-        guard compileResult.status == 0 else {
-            throw NSError(domain: "MFABridge", code: 1,
-                         userInfo: [NSLocalizedDescriptionKey: "metal compile failed: \(compileResult.output)"])
-        }
-
-        // Link to metallib
-        let linkResult = shell("xcrun -sdk macosx metallib '\(airFile.path)' -o '\(tempMetallib.path)' 2>&1")
-        guard linkResult.status == 0 else {
-            throw NSError(domain: "MFABridge", code: 2,
-                         userInfo: [NSLocalizedDescriptionKey: "metallib link failed: \(linkResult.output)"])
-        }
-
-        // Move to cache location
-        try? fileManager.removeItem(at: finalMetallib)
-        try fileManager.copyItem(at: tempMetallib, to: finalMetallib)
+        try? FileManager.default.removeItem(at: finalMetallib)
+        try metallibData.write(to: finalMetallib)
 
         // Load and return
-        return try device.makeLibrary(URL: finalMetallib)
+        let dispatchData = metallibData.withUnsafeBytes { DispatchData(bytes: $0) }
+        return try device.makeLibrary(data: dispatchData)
     }
 
     private func shell(_ command: String) -> (output: String, status: Int32) {
@@ -216,11 +162,8 @@ public class MetallibCache {
                 )
                 desc.transposeState = (Q: false, K: false, V: false, O: false)
 
-                let kernelDesc = desc.kernelDescriptor(type: .forward)
-                let kernel = AttentionKernel(descriptor: kernelDesc)
-                let source = kernel.createSource()
-
-                _ = try getLibrary(source: source, device: device)
+                // Use FlashAttention's built-in MetalASM pipeline (with caching)
+                let _ = AttentionKernel.pipeline(for: desc, type: .forward)
                 print("  [\(i+1)/\(configurations.count)] seqLen=\(config.seqLen), headDim=\(config.headDim), fp16=\(config.lowPrecision) ✓")
             } catch {
                 print("  [\(i+1)/\(configurations.count)] FAILED: \(error)")
@@ -392,22 +335,8 @@ public class MetallibCache {
                 )
                 desc.transposeState = (Q: false, K: false, V: false, O: false)
 
-                let kernelDesc = desc.kernelDescriptor(type: .forward)
-                let kernel = AttentionKernel(descriptor: kernelDesc)
-                let source = kernel.createSource()
-
-                let constants = MTLFunctionConstantValues()
-                desc.setFunctionConstants(constants)
-
-                // This will load from cache or compile
-                _ = try getPipeline(
-                    source: source,
-                    functionName: "attention",
-                    constants: constants,
-                    rowDim: UInt32(config.seqLen),
-                    colDim: UInt32(config.seqLen),
-                    device: device
-                )
+                // Use FlashAttention's built-in MetalASM pipeline (with caching)
+                let _ = AttentionKernel.pipeline(for: desc, type: .forward)
             } catch {
                 // Ignore errors during preload
             }

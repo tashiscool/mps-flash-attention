@@ -11,19 +11,49 @@
 import Foundation
 import Metal
 import FlashAttention
+import MetalASM
+
+/// Create a MonolithicDescriptor from an AttentionDescriptor for IR generation.
+private func makeMonolithicDescriptor(from desc: AttentionDescriptor) -> AttentionKernel.MonolithicDescriptor {
+    let dims = desc.matrixDimensions!
+    let ts = desc.transposeState!
+    let R = dims.row, C = dims.column, D = UInt32(dims.head)
+    var mono = AttentionKernel.MonolithicDescriptor()
+    mono.R = R; mono.C = C
+    mono.leadingDimensions[.Q] = ts.Q ? R : D
+    mono.leadingDimensions[.K] = ts.K ? C : D
+    mono.leadingDimensions[.V] = ts.V ? C : D
+    mono.leadingDimensions[.O] = ts.O ? R : D
+    mono.leadingDimensions[.dO] = ts.O ? R : D
+    mono.leadingDimensions[.dV] = ts.V ? C : D
+    mono.leadingDimensions[.dK] = ts.K ? C : D
+    mono.leadingDimensions[.dQ] = ts.Q ? R : D
+    return mono
+}
 
 // MARK: - Batched Dispatch Parameters
 
-/// Struct matching the Metal BatchedParams struct for uniform buffer
-/// This is passed to the kernel at buffer index 30
+/// Struct matching the kernel's batch_params buffer layout (15 x UInt32 = 60 bytes).
+/// Layout: [numHeads, kvRepeatFactor, Q_stride, K_stride, V_stride, O_stride,
+///          L_stride, D_stride, dO_stride, dV_stride, dK_stride, dQ_stride,
+///          causalOffset, R, C]
+/// Strides are in elements (not bytes).
 struct BatchedParams {
-    var num_heads: UInt32
-    var Q_head_stride: UInt32
-    var K_head_stride: UInt32
-    var V_head_stride: UInt32
-    var O_head_stride: UInt32
-    var L_head_stride: UInt32
-    var mask_head_stride: UInt32
+    var numHeads: UInt32
+    var kvRepeatFactor: UInt32
+    var Q_stride: UInt32
+    var K_stride: UInt32
+    var V_stride: UInt32
+    var O_stride: UInt32
+    var L_stride: UInt32
+    var D_stride: UInt32
+    var dO_stride: UInt32
+    var dV_stride: UInt32
+    var dK_stride: UInt32
+    var dQ_stride: UInt32
+    var causalOffset: UInt32
+    var R: UInt32
+    var C: UInt32
 }
 
 // MARK: - Kernel Handle
@@ -91,23 +121,10 @@ public final class MFAKernelCache {
         desc.transposeState = (Q: false, K: false, V: false, O: false)
         self.descriptor = desc
 
-        // Create forward kernel
-        let fwdKernelDesc = desc.kernelDescriptor(type: .forward)
-        self.forwardKernel = AttentionKernel(descriptor: fwdKernelDesc)
-        let fwdSource = forwardKernel.createSource()
-
-        let fwdConstants = MTLFunctionConstantValues()
-        desc.setFunctionConstants(fwdConstants)
-
-        let dims = desc.matrixDimensions!
-        self.forwardPipeline = try MetallibCache.shared.getPipeline(
-            source: fwdSource,
-            functionName: "attention",
-            constants: fwdConstants,
-            rowDim: dims.row,
-            colDim: dims.column,
-            device: device
-        )
+        // Create forward kernel via FlashAttention's MetalASM pipeline
+        let fwdPV = AttentionKernel.pipeline(for: desc, type: .forward)
+        self.forwardKernel = fwdPV.kernel
+        self.forwardPipeline = fwdPV.pipeline
 
         // Pre-allocate batched params buffer
         self.batchedParamsBuffer = device.makeBuffer(
@@ -119,43 +136,15 @@ public final class MFAKernelCache {
     func createBackwardKernels() throws {
         guard backwardQueryKernel == nil else { return }
 
-        // Backward Query kernel
-        let bwdQDesc = descriptor.kernelDescriptor(type: .backwardQuery)
-        let bwdQKernel = AttentionKernel(descriptor: bwdQDesc)
-        let bwdQSource = bwdQKernel.createSource()
-        let bwdQLibrary = try device.makeLibraryWithFallback(source: bwdQSource)
+        // Backward Query kernel via FlashAttention's MetalASM pipeline
+        let bwdQPV = AttentionKernel.pipeline(for: descriptor, type: .backwardQuery)
+        self.backwardQueryKernel = bwdQPV.kernel
+        self.backwardQueryPipeline = bwdQPV.pipeline
 
-        let bwdQConstants = MTLFunctionConstantValues()
-        descriptor.setFunctionConstants(bwdQConstants)
-        let bwdQFunction = try bwdQLibrary.makeFunction(name: "attention", constantValues: bwdQConstants)
-
-        let bwdQPipelineDesc = MTLComputePipelineDescriptor()
-        bwdQPipelineDesc.computeFunction = bwdQFunction
-        bwdQPipelineDesc.maxTotalThreadsPerThreadgroup = 1024
-        let bwdQPipeline = try device.makeComputePipelineState(
-            descriptor: bwdQPipelineDesc, options: [], reflection: nil)
-
-        self.backwardQueryKernel = bwdQKernel
-        self.backwardQueryPipeline = bwdQPipeline
-
-        // Backward KV kernel
-        let bwdKVDesc = descriptor.kernelDescriptor(type: .backwardKeyValue)
-        let bwdKVKernel = AttentionKernel(descriptor: bwdKVDesc)
-        let bwdKVSource = bwdKVKernel.createSource()
-        let bwdKVLibrary = try device.makeLibraryWithFallback(source: bwdKVSource)
-
-        let bwdKVConstants = MTLFunctionConstantValues()
-        descriptor.setFunctionConstants(bwdKVConstants)
-        let bwdKVFunction = try bwdKVLibrary.makeFunction(name: "attention", constantValues: bwdKVConstants)
-
-        let bwdKVPipelineDesc = MTLComputePipelineDescriptor()
-        bwdKVPipelineDesc.computeFunction = bwdKVFunction
-        bwdKVPipelineDesc.maxTotalThreadsPerThreadgroup = 1024
-        let bwdKVPipeline = try device.makeComputePipelineState(
-            descriptor: bwdKVPipelineDesc, options: [], reflection: nil)
-
-        self.backwardKVKernel = bwdKVKernel
-        self.backwardKVPipeline = bwdKVPipeline
+        // Backward KV kernel via FlashAttention's MetalASM pipeline
+        let bwdKVPV = AttentionKernel.pipeline(for: descriptor, type: .backwardKeyValue)
+        self.backwardKVKernel = bwdKVPV.kernel
+        self.backwardKVPipeline = bwdKVPV.pipeline
     }
 
     /// Get strides for batched dispatch (in ELEMENTS, not bytes)
@@ -179,16 +168,28 @@ public final class MFAKernelCache {
     }
 
     /// Setup batched params buffer for dispatch
-    func setupBatchedParams(numHeads: Int) -> MTLBuffer {
+    func setupBatchedParams(numHeads: Int, numKVHeads: Int = 0) -> MTLBuffer {
         let strides = getStrides()
+        let kvHeads = numKVHeads > 0 ? UInt32(numKVHeads) : UInt32(numHeads)
+        let kvRepeat = UInt32(numHeads) / kvHeads
+        let R = UInt32(descriptor.matrixDimensions!.row)
+        let C = UInt32(descriptor.matrixDimensions!.column)
         var params = BatchedParams(
-            num_heads: UInt32(numHeads),
-            Q_head_stride: strides.qStride,
-            K_head_stride: strides.kStride,
-            V_head_stride: strides.kStride,
-            O_head_stride: strides.oStride,
-            L_head_stride: strides.lStride,
-            mask_head_stride: strides.maskStride
+            numHeads: UInt32(numHeads),
+            kvRepeatFactor: kvRepeat,
+            Q_stride: strides.qStride,
+            K_stride: strides.kStride,
+            V_stride: strides.kStride,
+            O_stride: strides.oStride,
+            L_stride: strides.lStride,
+            D_stride: R,  // D buffer stride = R elements per head
+            dO_stride: strides.oStride,
+            dV_stride: strides.kStride,
+            dK_stride: strides.kStride,
+            dQ_stride: strides.qStride,
+            causalOffset: 0,
+            R: R,
+            C: C
         )
         memcpy(batchedParamsBuffer!.contents(), &params, MemoryLayout<BatchedParams>.size)
         return batchedParamsBuffer!
@@ -1091,8 +1092,8 @@ public func mfa_debug_kernel_source(
     
     let kernelDesc = desc.kernelDescriptor(type: .forward)
     let kernel = AttentionKernel(descriptor: kernelDesc)
-    let source = kernel.createSource()
-    
+    let source = kernel.createSource(descriptor: makeMonolithicDescriptor(from: desc))
+
     // Check for bias code
     var result = ""
     if source.contains("attn_bias") {
@@ -1135,8 +1136,8 @@ public func mfa_dump_kernel_bias_code(
     
     let kernelDesc = desc.kernelDescriptor(type: .forward)
     let kernel = AttentionKernel(descriptor: kernelDesc)
-    let source = kernel.createSource()
-    
+    let source = kernel.createSource(descriptor: makeMonolithicDescriptor(from: desc))
+
     // Extract just the bias-related code
     var result = ""
     let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
